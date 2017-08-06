@@ -1,0 +1,11 @@
+[package]
+name = "rumpus"
+version = "0.1.0"
+authors = ["袁野 (Yuan Ye) <yuanyelele@openmailbox.org>"]
+
+[lib]
+name = "rumpus"
+crate-type = ["staticlib"] 
+
+[dependencies]
+num-complex = "0.1.40"
