@@ -17,13 +17,13 @@ typedef struct {
 } shapestate;
 
 unsigned rngseed = 22222;
-inline unsigned fast_rand(void)
+unsigned fast_rand(void)
 {
 	rngseed = (rngseed * 96314165) + 907633515;
 	return rngseed;
 }
 
-inline void shape_dither_toshort(shapestate *_ss, short *_o, float *_i, int _n)
+void shape_dither_toshort(shapestate *_ss, short *_o, float *_i, int _n)
 {
 	const float fcoef[8] = {
 		2.2061, -0.4706, -0.2534, -0.6214, 1.0587, 0.0676, -0.6054, -0.2738,	/* 44.1kHz noise shaping filter sd=2.51 */
@@ -60,27 +60,27 @@ inline void shape_dither_toshort(shapestate *_ss, short *_o, float *_i, int _n)
 	}
 }
 
-long long audio_write(float *pcm, int frame_size, FILE *fout,
-                      SpeexResamplerState *resampler, int *skip,
-                      shapestate *shapemem, long long maxout)
+size_t audio_write(const float *pcm, int frame_size, FILE *fout,
+                   SpeexResamplerState *resampler, int skip,
+                   shapestate *shapemem, unsigned maxout)
 {
-	short *out = alloca(sizeof(short) * MAX_FRAME_SIZE * 2);
-	float *buf = alloca(sizeof(float) * MAX_FRAME_SIZE * 2);
 	
-	int tmp_skip = 0;
-	if (skip) {
-		tmp_skip = (*skip > frame_size) ? (int)frame_size : *skip;
-		*skip -= tmp_skip;
-	}
-	unsigned in_len = frame_size - tmp_skip;
-	unsigned out_len = 1024 < maxout ? 1024 : maxout;
+	spx_uint32_t in_len = frame_size - skip;
+	spx_uint32_t out_len = maxout;
+	float *buf = malloc(sizeof(float) * maxout * 2);
 	speex_resampler_process_interleaved_float(resampler,
-						  pcm + 2 * tmp_skip, &in_len,
+						  pcm + 2 * skip, &in_len,
 						  buf, &out_len);
-	/*Convert to short and save to output file */
-	shape_dither_toshort(shapemem, out, buf, out_len);
 
-	return fwrite((char *)out, 2 * 2, out_len < maxout ? out_len : maxout, fout);
+	/*Convert to short and save to output file */
+	short *out = malloc(sizeof(short) * out_len * 2);
+	shape_dither_toshort(shapemem, out, buf, out_len);
+	free(buf);
+
+	size_t size = fwrite((char *)out, 2 * 2, out_len, fout);
+	free(out);
+
+	return size;
 }
 
 void fwrite32(int i32, FILE *file)
@@ -121,7 +121,6 @@ int main(int argc, char **argv)
 	int stream_init = 0;
 	ogg_int64_t page_granule = 0;
 	ogg_int64_t link_out = 0;
-	ogg_page og;
 	ogg_packet op;
 	ogg_stream_state os;
 	ogg_int64_t audio_size = 0;
@@ -156,73 +155,62 @@ int main(int argc, char **argv)
 		int nb_read = fread(data, sizeof(char), 200, fin);
 		ogg_sync_wrote(&oy, nb_read);
 
-		/*Loop for all complete pages we got (most likely only one) */
-		while (ogg_sync_pageout(&oy, &og) == 1) {
-			if (stream_init == 0) {
-				ogg_stream_init(&os, ogg_page_serialno(&og));
-				stream_init = 1;
-			}
-			/*Add page to the bitstream */
-			ogg_stream_pagein(&os, &og);
-			page_granule = ogg_page_granulepos(&og);
-			/*Extract all available packets */
-			while (ogg_stream_packetout(&os, &op) == 1) {
-				if (op.b_o_s) {
-					link_out = 0;
-					packet_count = 0;
-					total_links++;
-	                                preskip = op.packet[10] + (op.packet[11] << 8);
+		ogg_page og;
+		if (ogg_sync_pageout(&oy, &og) == 0)
+			continue;
 
-					/*Remember how many samples at the front we were told to skip
-					   so that we can adjust the timestamp counting. */
-					gran_offset = preskip;
+		if (stream_init == 0) {
+			ogg_stream_init(&os, ogg_page_serialno(&og));
+			stream_init = 1;
+		}
+		/*Add page to the bitstream */
+		ogg_stream_pagein(&os, &og);
+		page_granule = ogg_page_granulepos(&og);
+		/*Extract all available packets */
+		while (ogg_stream_packetout(&os, &op) == 1) {
+			if (packet_count == 0) {
+				link_out = 0;
+				total_links++;
+	                        preskip = op.packet[10] + (op.packet[11] << 8);
 
-					/*Setup the memory for the dithered output */
-					shapemem.a_buf = calloc(2, sizeof(float) * 4);
-					shapemem.b_buf = calloc(2, sizeof(float) * 4);
+				/*Remember how many samples at the front we were told to skip
+				   so that we can adjust the timestamp counting. */
+				gran_offset = preskip;
 
-					output = malloc(sizeof(float) * MAX_FRAME_SIZE * 2);
+				/*Setup the memory for the dithered output */
+				shapemem.a_buf = calloc(2, sizeof(float) * 4);
+				shapemem.b_buf = calloc(2, sizeof(float) * 4);
 
-					/*Normal players should just play at 48000 or their maximum rate,
-					   as described in the OggOpus spec.  But for commandline tools
-					   like opusdec it can be desirable to exactly preserve the original
-					   sampling rate and duration, so we have a resampler here. */
-					resampler = speex_resampler_init(2, 48000, 44100, 5, NULL);
-					speex_resampler_skip_zeros(resampler);
-					fout = fopen(argv[2], "wb");
-					write_wav_header(fout);
-				} else if (packet_count != 1) {
-					/*Are we simulating loss for this packet? */
-					int frame_size = opus_decoder_decode(st, (unsigned char *)op.packet,
-					                                     op.bytes, output);
+				output = malloc(sizeof(float) * MAX_FRAME_SIZE * 2);
 
-					/*This handles making sure that our output duration respects
-					   the final end-trim by not letting the output sample count
-					   get ahead of the granpos indicated value. */
-					long long maxout = (page_granule - gran_offset) * 44100 / 48000 - link_out;
-					long long outsamp = audio_write(output, frame_size, fout,
-							                resampler, &preskip, &shapemem,
-							                maxout);
-					link_out += outsamp;
-					audio_size += 2 * outsamp * 2;
-				}
-				packet_count++;
-			}
-			if (op.e_o_s) {
-				float *zeros = calloc(100 * 2, sizeof(float));
-				int drain = speex_resampler_get_input_latency(resampler);
-				long long outsamp = audio_write(zeros, drain, fout, resampler, NULL, &shapemem,
-						                (page_granule - gran_offset) * 44100 / 48000 - link_out);
+				/*Normal players should just play at 48000 or their maximum rate,
+				   as described in the OggOpus spec.  But for commandline tools
+				   like opusdec it can be desirable to exactly preserve the original
+				   sampling rate and duration, so we have a resampler here. */
+				resampler = speex_resampler_init(2, 48000, 44100, 5, NULL);
+				speex_resampler_skip_zeros(resampler);
+				fout = fopen(argv[2], "wb");
+				write_wav_header(fout);
+			} else if (packet_count != 1) {
+				/*Are we simulating loss for this packet? */
+				int frame_size = opus_decoder_decode(st, (unsigned char *)op.packet,
+				                                     op.bytes, output);
+
+				/*This handles making sure that our output duration respects
+				   the final end-trim by not letting the output sample count
+				   get ahead of the granpos indicated value. */
+				size_t maxout = (page_granule - gran_offset) * 44100 / 48000 - link_out;
+				size_t outsamp = audio_write(output, frame_size, fout,
+						             resampler, preskip, &shapemem, maxout);
+				preskip = 0;
+				link_out += outsamp;
 				audio_size += 2 * outsamp * 2;
-				free(zeros);
-				speex_resampler_destroy(resampler);
-				free(st);
 			}
+			packet_count++;
 		}
 	}
 
 	fprintf(stderr, "\rDecoding complete.\n");
-	fflush(stderr);
 
 	/*If we were writing wav, go set the duration. */
 	fseek(fout, 4, SEEK_SET);
@@ -234,10 +222,13 @@ int main(int argc, char **argv)
 
 	ogg_stream_clear(&os);
 	ogg_sync_clear(&oy);
+	speex_resampler_destroy(resampler);
 
 	free(shapemem.a_buf);
 	free(shapemem.b_buf);
 	free(output);
+	free(st);
+
 	fclose(fin);
 	fclose(fout);
 
