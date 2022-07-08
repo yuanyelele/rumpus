@@ -8,10 +8,10 @@ fn pre_rotate(fft: &kiss_fft::KissFft, x: &[f32], y: &mut [f32]) {
     let stride = 1 << fft.shift;
     let n = y.len();
     for i in 0..n / 2 {
-        y[2 * fft.bitrev[i]] = x[stride * 2 * i] * fft.trig[i] -
-                               x[stride * (n - 1 - 2 * i)] * fft.trig[n / 2 + i];
-        y[2 * fft.bitrev[i] + 1] = x[stride * (n - 1 - 2 * i)] * fft.trig[i] +
-                                   x[stride * 2 * i] * fft.trig[n / 2 + i];
+        y[2 * fft.bitrev[i]] =
+            x[stride * 2 * i] * fft.trig[i] - x[stride * (n - 1 - 2 * i)] * fft.trig[n / 2 + i];
+        y[2 * fft.bitrev[i] + 1] =
+            x[stride * (n - 1 - 2 * i)] * fft.trig[i] + x[stride * 2 * i] * fft.trig[n / 2 + i];
     }
 }
 
@@ -48,9 +48,10 @@ fn mirror(y: &mut [f32], window: &[f32]) {
 }
 
 pub unsafe fn mdct_backward(mode: &mode::CeltMode, x: &[f32], y: &mut [f32], shift: usize) {
-    let complex = std::slice::from_raw_parts_mut((&mut y[120 / 2..]).as_mut_ptr() as
-                                                 (*mut num_complex::Complex<f32>),
-                                                 480 >> shift);
+    let complex = std::slice::from_raw_parts_mut(
+        (&mut y[120 / 2..]).as_mut_ptr() as *mut num_complex::Complex<f32>,
+        480 >> shift,
+    );
     let fft = if shift == 0 { &mode.fft0 } else { &mode.fft3 };
     pre_rotate(fft, x, &mut y[120 / 2..120 / 2 + (960 >> shift)]);
     kiss_fft::opus_fft(fft, complex, &mode.twiddles);
